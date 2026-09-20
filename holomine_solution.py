@@ -241,9 +241,36 @@ def load_all_oof():
 
 
 def make_submission(test_ids, prices, filename: str) -> str:
+    """Tulis submission dengan BERANGKAT dari sample_submission.csv.
+
+    Kolom listPrice-nya diisi prediksi lewat join pada id, jadi urutan baris,
+    nama kolom dan jumlah baris dijamin identik dengan berkas contoh -- bukan
+    cuma "mirip". Kalau sample_submission tidak ketemu, jatuh ke id test.
+
+    Di Kaggle file juga disalin ke /kaggle/working (akar, bukan subfolder),
+    karena HANYA isi folder itu yang muncul di tab Output setelah Save Version.
+    """
+    preds = pd.DataFrame({"id": np.asarray(test_ids),
+                          "listPrice": np.round(np.asarray(prices), 2)})
+    sample = os.path.join(data_dir(), "sample_submission.csv")
+    if os.path.exists(sample):
+        sub = pd.read_csv(sample)[["id"]].merge(preds, on="id", how="left")
+        missing = int(sub["listPrice"].isna().sum())
+        if missing:
+            print(f"  !! {missing} id di sample_submission tidak punya prediksi; "
+                  f"diisi median", file=sys.stderr)
+            sub["listPrice"] = sub["listPrice"].fillna(preds["listPrice"].median())
+    else:
+        sub = preds
+
     os.makedirs(SUBMISSIONS, exist_ok=True)
     path = os.path.join(SUBMISSIONS, filename)
-    pd.DataFrame({"id": test_ids, "listPrice": np.round(np.asarray(prices), 2)}).to_csv(path, index=False)
+    sub.to_csv(path, index=False)
+
+    kaggle_out = os.path.join("/kaggle/working", filename)
+    if os.path.isdir("/kaggle/working") and os.path.abspath(path) != os.path.abspath(kaggle_out):
+        sub.to_csv(kaggle_out, index=False)
+        print(f"  (disalin juga ke {kaggle_out} supaya muncul di Output Kaggle)")
     return path
 
 
@@ -1192,6 +1219,12 @@ def main(argv=None):
         print(f"    {len(test)} baris, kolom id + listPrice, urutan id sama dengan sample_submission.")
         print(f"    CV MAE {final:,.0f}  (baseline tebak-median {mae(y_raw, np.median(y_raw)):,.0f})")
         print("    -> unggah file ini ke Kaggle.")
+        if os.path.isdir("/kaggle/working"):
+            print("\n    isi /kaggle/working (inilah yang jadi Output notebook):")
+            for f in sorted(os.listdir("/kaggle/working")):
+                full = os.path.join("/kaggle/working", f)
+                tag = "/" if os.path.isdir(full) else f"  {os.path.getsize(full):,} byte"
+                print(f"      {f}{tag}")
     if failures:
         print("tahap gagal:", ", ".join(failures))
         print("Blend tetap memakai model yang berhasil. Perbaiki lalu jalankan ulang -- "
