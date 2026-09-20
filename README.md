@@ -7,10 +7,18 @@ lalu mengisi kolom `listPrice` di `sample_submission.csv` → `submission.csv`.
 pip install numpy pandas scikit-learn scipy lightgbm
 pip install torch transformers sentencepiece      # untuk tahap GPU
 
-python train_and_predict.py                  # semua (butuh GPU T4)
-python train_and_predict.py --quick          # 1 fold 1 epoch, uji cepat
-python train_and_predict.py --no-transformer # CPU saja, ~8 menit
+python train_and_predict.py                  # ~30 menit total di T4
+python train_and_predict.py --quick          # uji cepat
+python train_and_predict.py --no-transformer # CPU saja, ~10 menit
+
+# kalau waktu longgar dan mau akurasi maksimal (~2 jam):
+python train_and_predict.py --model microsoft/deberta-v3-base --batch-size 16 --folds 5
 ```
+
+**Default sengaja ringan.** Backbone-nya `deberta-v3-xsmall` (22M parameter,
+~5x lebih cepat dari base) dengan 3 fold. `--folds` adalah jumlah *split*:
+berapa pun nilainya, seluruh baris tetap mendapat prediksi out-of-fold, jadi
+mengecilkannya menghemat waktu tanpa membuang model itu dari blend.
 
 Di Kaggle: Settings → Accelerator **GPU T4**, Internet **ON**, lalu satu sel:
 
@@ -29,12 +37,32 @@ menjadi **Output** notebook setelah Save Version.
 |---|---|---|
 | 1 | Baca train.csv (14.640) + test.csv (3.659) | detik |
 | 2 | **Latih** 6 model CPU: ridge kata/karakter, LinearSVR, kNN kata/karakter, LightGBM | ~10 menit |
-| 3 | **Latih** DeBERTa-v3-base di GPU T4, 5 fold | ~2 jam (batch 8); skrip mencetak estimasinya sendiri setelah epoch pertama |
+| 3 | **Latih** DeBERTa-v3-**xsmall** di GPU T4, 3 fold | ~20 menit; skrip mencetak estimasinya sendiri setelah epoch pertama |
 | 4 | Gabungkan: greedy blend → stacking → kalibrasi | ~2 menit |
 | 5 | Tulis submission.csv | detik |
 
 Tidak ada cache dan tidak ada tahap yang bisa dilewati: sekali jalan = semuanya
 dilatih ulang.
+
+---
+
+## Catatan presisi di GPU T4
+
+T4 adalah Turing (sm_75) dan **tidak punya bf16 native**, tapi
+`torch.cuda.is_bf16_supported()` di PyTorch baru tetap mengembalikan `True`
+karena menghitung bf16 emulasi — dan emulasinya menghasilkan NaN. Karena itu
+presisi dipilih dari compute capability (`sm_80+` baru bf16), bukan dari fungsi
+itu.
+
+Bobot juga dipaksa fp32 saat dimuat. `transformers` versi baru memuat checkpoint
+dengan dtype aslinya; kalau itu fp16, gradiennya ikut fp16 dan `GradScaler`
+melempar *"Attempting to unscale FP16 gradients"*. Mixed precision yang benar
+adalah **bobot fp32 + autocast**, bukan bobot fp16.
+
+Kalau training tetap meledak, skrip mendeteksinya dalam 30 langkah pertama lalu
+mengulang sendiri di fp32 — jadi kegagalan presisi memakan hitungan detik, bukan
+satu jam. Kalau fp32 pun gagal, tahap transformer dilewati dan submission tetap
+dibuat dari model CPU.
 
 ---
 

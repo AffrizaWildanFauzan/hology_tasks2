@@ -47,14 +47,18 @@ import pandas as pd
 # KONFIGURASI - ubah di sini kalau perlu
 # =============================================================================
 
-MODEL_NAME = "microsoft/deberta-v3-base"   # juara de-facto regresi teks di Kaggle
+# Default sengaja RINGAN supaya selesai ~20-30 menit di T4.
+# Untuk akurasi maksimal (dan waktu ~2 jam):
+#   --model microsoft/deberta-v3-base --batch-size 16 --folds 5
+MODEL_NAME = "microsoft/deberta-v3-xsmall"  # 22M param, ~5x lebih cepat dari base
 MAX_LEN    = 512      # p99 teks = 521 token; di 512 cuma 1,1% listing terpotong
-BATCH_SIZE = 16       # muat di T4 16GB dengan fp16
+BATCH_SIZE = 32       # xsmall muat longgar di T4 16GB
 EPOCHS     = 3
-LR         = 2e-5     # untuk backbone
-HEAD_LR    = 1e-4     # untuk kepala regresi (dilatih dari nol, perlu lebih besar)
+LR         = 3e-5     # model kecil tahan LR sedikit lebih tinggi
+HEAD_LR    = 1e-4     # kepala regresi dilatih dari nol, perlu lebih besar
 LLRD       = 0.9      # layer-wise LR decay
-N_FOLDS    = 5
+N_FOLDS    = 5        # untuk model CPU
+N_FOLDS_TF = 3        # untuk transformer -- tetap menutupi semua baris
 SEED       = 42
 
 SUBMISSION_NAME = "submission.csv"
@@ -103,12 +107,17 @@ def from_log(z):
     return np.exp(np.clip(np.asarray(z, dtype=float), 0.0, np.log(3e8)))
 
 
-def make_folds(y):
-    """5-fold distratifikasi atas desil log-harga, supaya rumah mahal terbagi
-    rata. Semua model memakai fold yang sama agar prediksinya bisa digabung."""
+def make_folds(y, n_splits=None):
+    """Fold distratifikasi atas desil log-harga, supaya rumah mahal terbagi rata.
+
+    Transformer boleh memakai jumlah fold lebih sedikit demi waktu: apa pun
+    jumlahnya, fold TETAP menutupi seluruh baris, jadi prediksi OOF-nya lengkap
+    dan bisa ikut digabung. (Memotong daftar fold justru membuat sebagian baris
+    tidak punya prediksi dan modelnya terbuang dari blend.)
+    """
     from sklearn.model_selection import StratifiedKFold
     bins = pd.qcut(np.log(y), q=20, labels=False, duplicates="drop")
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    skf = StratifiedKFold(n_splits=n_splits or N_FOLDS, shuffle=True, random_state=SEED)
     return list(skf.split(np.zeros(len(y)), bins))
 
 
@@ -315,6 +324,10 @@ def build_features(texts) -> np.ndarray:
 # Empat model, semuanya dilatih ulang tiap dijalankan. Masing-masing menghasilkan
 # prediksi out-of-fold (untuk mengukur & menggabung) dan prediksi test.
 
+class PrecisionFailure(RuntimeError):
+    """Training meledak jadi NaN/inf -- hampir selalu soal presisi, bukan data."""
+
+
 def knn_median_predict(Xn, Xn_te, y_log, folds, k=25, power=3, chunk=512):
     """kNN kosinus yang memprediksi MEDIAN berbobot harga tetangga.
 
@@ -457,7 +470,7 @@ def train_cpu_models(train, test, y_raw, folds, feats):
 # 4. LATIH TRANSFORMER DI GPU (T4)
 # =============================================================================
 
-def train_transformer(train, test, y_raw, folds, args):
+def train_transformer(train, test, y_raw, folds, args, force_fp32=False):
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, Dataset
@@ -478,13 +491,17 @@ def train_transformer(train, test, y_raw, folds, args):
         # Turing (sm_75) yang tidak punya bf16 native, dan emulasinya membuat
         # loss jadi NaN. Ampere (sm_80, mis. A100) ke atas baru punya bf16 asli.
         native_bf16 = gp.major >= 8
-        if args.precision == "auto":
+        if force_fp32:
+            amp_dtype = None
+        elif args.precision == "auto":
             amp_dtype = torch.bfloat16 if native_bf16 else torch.float16
         elif args.precision == "bf16":
             amp_dtype = torch.bfloat16
         elif args.precision == "fp16":
             amp_dtype = torch.float16
         else:
+            amp_dtype = None
+        if force_fp32:
             amp_dtype = None
         label = {torch.bfloat16: "bf16", torch.float16: "fp16", None: "fp32"}[amp_dtype]
         print(f"\n[3/5] LATIH transformer di {gp.name} ({gp.total_memory / 1e9:.0f} GB, sm_{gp.major}{gp.minor})")
@@ -530,7 +547,16 @@ def train_transformer(train, test, y_raw, folds, args):
             super().__init__()
             cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
             cfg.update({"hidden_dropout_prob": 0.0, "attention_probs_dropout_prob": 0.0})
-            self.backbone = AutoModel.from_pretrained(args.model, config=cfg, trust_remote_code=True)
+            # WAJIB fp32. transformers versi baru memuat bobot dengan dtype
+            # dari checkpoint; kalau itu fp16, gradiennya juga fp16 dan
+            # GradScaler.unscale_() melempar "Attempting to unscale FP16
+            # gradients". Mixed precision yang benar = bobot fp32 + autocast.
+            try:
+                self.backbone = AutoModel.from_pretrained(
+                    args.model, config=cfg, dtype=torch.float32, trust_remote_code=True)
+            except TypeError:      # transformers lama memakai nama torch_dtype
+                self.backbone = AutoModel.from_pretrained(
+                    args.model, config=cfg, torch_dtype=torch.float32, trust_remote_code=True)
             self.head = nn.Sequential(nn.LayerNorm(cfg.hidden_size), nn.Linear(cfg.hidden_size, 1))
             # Bias awal = rata-rata log harga, jadi tebakan pertama model adalah
             # harga median (~$500rb), bukan exp(0) = $1. Tanpa ini epoch pertama
@@ -587,6 +613,8 @@ def train_transformer(train, test, y_raw, folds, args):
         t_fold = time.time()
         torch.manual_seed(SEED + fold)
         model = Regressor().to(device)
+        if next(model.parameters()).dtype != torch.float32:
+            model = model.float()      # jaring pengaman terakhir
         dl_tr = DataLoader(Listings(texts[tr], y_log[tr]), batch_size=args.batch_size, shuffle=True,
                            collate_fn=collate, num_workers=2, pin_memory=True, drop_last=True)
         dl_va = DataLoader(Listings(texts[va], y_log[va]), batch_size=args.batch_size * 2,
@@ -599,6 +627,7 @@ def train_transformer(train, test, y_raw, folds, args):
         loss_fn = nn.SmoothL1Loss(beta=0.15)   # Huber: L1 yang halus di dekat nol
 
         best_mae, best_val, best_test = np.inf, None, None
+        nonfinite = 0
         for epoch in range(args.epochs):
             model.train()
             running, seen, t0 = 0.0, 0, time.time()
@@ -608,7 +637,14 @@ def train_transformer(train, test, y_raw, folds, args):
                 with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
                     loss = loss_fn(model(**batch), labels)
                 if not torch.isfinite(loss):
-                    opt.zero_grad(set_to_none=True)      # overflow fp16: buang step
+                    opt.zero_grad(set_to_none=True)      # overflow: buang step
+                    nonfinite += 1
+                    # Gagal cepat: kalau sudah kacau di 30 langkah pertama,
+                    # jangan buang satu jam -- hentikan dan ulangi di fp32.
+                    if epoch == 0 and step < 30 and nonfinite >= 10:
+                        raise PrecisionFailure(
+                            f"{nonfinite} dari {step + 1} langkah pertama menghasilkan "
+                            f"nilai non-finite")
                     continue
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
@@ -805,7 +841,8 @@ def main(argv=None):
     ap.add_argument("--epochs", type=int, default=EPOCHS)
     ap.add_argument("--lr", type=float, default=LR)
     ap.add_argument("--head-lr", type=float, default=HEAD_LR)
-    ap.add_argument("--folds", type=int, default=N_FOLDS, help="jumlah fold transformer")
+    ap.add_argument("--folds", type=int, default=N_FOLDS_TF,
+                    help="jumlah fold transformer (tetap menutupi semua baris)")
     ap.add_argument("--no-transformer", action="store_true", help="CPU saja")
     ap.add_argument("--no-cpu-models", action="store_true", help="transformer saja")
     ap.add_argument("--quick", action="store_true", help="1 fold 1 epoch, untuk uji cepat")
@@ -827,7 +864,12 @@ def main(argv=None):
     if unknown:
         print(f"argumen diabaikan: {' '.join(unknown)}", file=sys.stderr)
     if args.quick:
-        args.folds, args.epochs = 1, 1
+        args.folds, args.epochs = 2, 1
+    if args.folds < 2:
+        print("--folds minimal 2 (nilainya adalah jumlah split, bukan jumlah fold "
+              "yang dilatih; berapa pun nilainya semua baris tetap tercakup).",
+              file=sys.stderr)
+        return 1
 
     t_start = time.time()
     data_path = find_data_dir()
@@ -864,7 +906,19 @@ def main(argv=None):
         oof.update(o)
         testp.update(t)
     if not args.no_transformer:
-        o, t = train_transformer(train, test, y_raw, folds[:args.folds], args)
+        folds_tf = make_folds(y_raw, args.folds)   # fold sendiri, tetap menutupi SEMUA baris
+        try:
+            o, t = train_transformer(train, test, y_raw, folds_tf, args)
+        except PrecisionFailure as exc:
+            print(f"\n   !! training meledak ({exc}).", flush=True)
+            print("   !! mengulang seluruh tahap ini di fp32 (lebih lambat tapi stabil).",
+                  flush=True)
+            try:
+                o, t = train_transformer(train, test, y_raw, folds_tf, args, force_fp32=True)
+            except PrecisionFailure as exc2:
+                print(f"   !! masih meledak di fp32 ({exc2}). Tahap transformer dilewati; "
+                      f"submission tetap dibuat dari model CPU.", file=sys.stderr)
+                o, t = {}, {}
         oof.update(o)
         testp.update(t)
 
