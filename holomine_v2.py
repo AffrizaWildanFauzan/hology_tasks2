@@ -23,12 +23,31 @@ Perubahan dari v1 (semuanya terukur atau beralasan, lihat CATATAN di bawah):
 
 Artefak v1 di /kaggle/working/hm DIPAKAI ULANG. Tidak ada yang dihitung ulang percuma.
 
-Pakai (Kaggle, T4 x2, Internet ON):
+Pakai di NOTEBOOK KAGGLE (Settings: Accelerator = GPU T4 x2, Internet = On,
+Persistence = Files only supaya /kaggle/working/hm tidak hilang saat kernel restart):
+
+    # sel 1
     !pip install -q -U "transformers>=4.48" sentencepiece protobuf lightgbm
-    !python holomine_v2.py --stage feats                      # ~4 menit, CPU
-    !python holomine_v2.py --stage embed --emb gte_l,bge_l    # ~30 menit per model
-    !python holomine_v2.py --stage ft --ft mbert6             # opsional, ~2 jam
-    !python holomine_v2.py --stage stack                      # ~1 menit
+
+    # sel 2 - tahap CPU, ~2 menit (tetap di sesi GPU; tidak perlu ganti accelerator)
+    !python holomine_v2.py --stage feats
+
+    # sel 3 - dua GPU paralel. WAJIB --no-stack supaya tidak rebutan submission.csv
+    !CUDA_VISIBLE_DEVICES=0 nohup python holomine_v2.py --stage embed --emb bge_l --no-stack > a.log 2>&1 &
+    !CUDA_VISIBLE_DEVICES=1 nohup python holomine_v2.py --stage embed --emb e5_l  --no-stack > b.log 2>&1 &
+
+    # sel 4 - pantau
+    !sleep 60; tail -5 a.log b.log
+
+    # sel 5 - setelah keduanya selesai, fine-tune dibagi 2 GPU
+    !CUDA_VISIBLE_DEVICES=0 nohup python holomine_v2.py --stage ft --ft mbert6 --folds 0,1,2 --no-stack > c.log 2>&1 &
+    !CUDA_VISIBLE_DEVICES=1 nohup python holomine_v2.py --stage ft --ft mbert6 --folds 3,4   --no-stack > d.log 2>&1 &
+
+    # sel 6 - rakit semuanya jadi submission (~1 menit, CPU)
+    !python holomine_v2.py --stage stack
+
+Artefak v1 di /kaggle/working/hm DIPAKAI ULANG. Tidak ada yang dihitung ulang percuma.
+Semua tahap aman di-resume: jalankan ulang perintah yang sama untuk melanjutkan.
 """
 import argparse, gc, glob, os, re, sys, time
 import numpy as np
@@ -752,6 +771,9 @@ def main():
     ap.add_argument("--path", action="append", default=[], help="override model: nama=path")
     ap.add_argument("--sub", type=int, default=0, help="subsample (smoke test)")
     ap.add_argument("--out", default="submission.csv")
+    ap.add_argument("--no-stack", action="store_true",
+                    help="lewati stacking. WAJIB dipakai saat menjalankan 2 proses paralel "
+                         "di 2 GPU, supaya keduanya tidak menulis submission.csv bersamaan.")
     a = ap.parse_args()
     for kv in a.path:
         k, v = kv.split("=", 1)
@@ -772,7 +794,12 @@ def main():
     d, tr, te = load(a.sub); y = tr.listPrice.values; fold = get_folds(y)
     log(f"data: {d} train={len(tr)} test={len(te)}")
     uw = not a.no_adv_weight
-    st = lambda: stage_stack(tr, te, y, fold, a.out, use_w=uw, nseed=a.nseed)
+
+    def st():
+        if a.no_stack:
+            log("[stack] dilewati (--no-stack). Jalankan '--stage stack' setelah semua proses selesai.")
+            return None
+        return stage_stack(tr, te, y, fold, a.out, use_w=uw, nseed=a.nseed)
 
     if a.stage in ("all", "cpu"):
         stage_cpu(tr, te, y, fold); st()
