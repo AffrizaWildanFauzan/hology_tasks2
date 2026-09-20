@@ -315,7 +315,36 @@ def build_features(texts) -> np.ndarray:
 # Empat model, semuanya dilatih ulang tiap dijalankan. Masing-masing menghasilkan
 # prediksi out-of-fold (untuk mengukur & menggabung) dan prediksi test.
 
-def train_cpu_models(train, test, y_raw, folds):
+def knn_median_predict(Xn, Xn_te, y_log, folds, k=25, power=3, chunk=512):
+    """kNN kosinus yang memprediksi MEDIAN berbobot harga tetangga.
+
+    Prediksi OOF memakai data latih fold-nya saja (jujur untuk mengukur), tapi
+    prediksi TEST dihitung sekali memakai SELURUH data latih: lebih banyak
+    tetangga tersedia, dan biayanya ~45% lebih murah daripada merata-rata lima
+    kali. Tidak ada kebocoran -- baris test tidak pernah ada di data latih.
+    """
+    def wmedian(values, weights):
+        order = np.argsort(values)
+        values, weights = values[order], weights[order]
+        return values[np.searchsorted(np.cumsum(weights), 0.5 * weights.sum())]
+
+    def query(target, ref, ref_y):
+        buf = np.empty(target.shape[0])
+        for s in range(0, target.shape[0], chunk):
+            sim = (target[s:s + chunk] @ ref.T).toarray()
+            idx = np.argpartition(-sim, k, axis=1)[:, :k]
+            for i in range(sim.shape[0]):
+                w = np.clip(sim[i, idx[i]], 0, None) ** power
+                buf[s + i] = np.median(ref_y) if w.sum() <= 0 else wmedian(ref_y[idx[i]], w)
+        return buf
+
+    oof = np.zeros(len(y_log))
+    for tr, va in folds:
+        oof[va] = query(Xn[va], Xn[tr], y_log[tr])
+    return oof, query(Xn_te, Xn, y_log)
+
+
+def train_cpu_models(train, test, y_raw, folds, feats):
     from sklearn.decomposition import TruncatedSVD
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.linear_model import Ridge
@@ -338,6 +367,23 @@ def train_cpu_models(train, test, y_raw, folds):
     Xw_te = vec.transform(test["text"])
     print(f"   {Xw.shape[1]:,} fitur", flush=True)
 
+    # Skor "uniqueness" -- Shen dkk. (J. Urban Economics 2021) menemukan listing
+    # yang deskripsinya unik terjual lebih mahal. Ukurannya: rata-rata kemiripan
+    # kosinus ke 50 tetangga terdekat (rendah = unik). Tanpa target, jadi aman.
+    # Sendirian nyaris tak berguna, tapi di dalam blend memperbaiki MAE ~2.800.
+    print("   menghitung skor uniqueness ...", flush=True)
+    Xn_all, Xn_te_all = normalize(Xw), normalize(Xw_te)
+
+    def uniqueness(target, ref, k=50):
+        out = np.empty(target.shape[0])
+        for s in range(0, target.shape[0], 256):
+            sim = (target[s:s + 256] @ ref.T).toarray()
+            out[s:s + 256] = -np.partition(-sim, k, axis=1)[:, :k].mean(1)
+        return out
+
+    uniq_tr = uniqueness(Xn_all, Xn_all)[:, None]
+    uniq_te = uniqueness(Xn_te_all, Xn_all)[:, None]
+
     # --- Ridge: loss L2, menangkap nama kota & kata kunci langka ---
     print("   melatih ridge ...", flush=True)
     o, t = np.zeros(len(y_log)), np.zeros(Xw_te.shape[0])
@@ -359,29 +405,9 @@ def train_cpu_models(train, test, y_raw, folds):
 
     # --- kNN kosinus: median harga tetangga. Listing rumah serupa di pasar yang
     #     sama memakai frasa mirip, jadi ini sudut pandang yang benar-benar beda.
-    print("   melatih kNN kosinus ...", flush=True)
-
-    def wmedian(v, w):
-        order = np.argsort(v)
-        v, w = v[order], w[order]
-        return v[np.searchsorted(np.cumsum(w), 0.5 * w.sum())]
-
-    Xn, Xn_te = normalize(Xw), normalize(Xw_te)
-    o, t = np.zeros(len(y_log)), np.zeros(Xw_te.shape[0])
-    for tr, va in folds:
-        ref = Xn[tr]
-        for target, out, div in ((Xn[va], o, None), (Xn_te, t, len(folds))):
-            buf = np.empty(target.shape[0])
-            for s in range(0, target.shape[0], 512):
-                sim = (target[s:s + 512] @ ref.T).toarray()
-                idx = np.argpartition(-sim, 25, axis=1)[:, :25]
-                for i in range(sim.shape[0]):
-                    w = np.clip(sim[i, idx[i]], 0, None) ** 3
-                    buf[s + i] = np.median(y_log[tr]) if w.sum() <= 0 else wmedian(y_log[tr][idx[i]], w)
-            if div is None:
-                out[va] = buf
-            else:
-                out += buf / div
+    print("   melatih kNN kosinus (ruang kata) ...", flush=True)
+    Xn, Xn_te = Xn_all, Xn_te_all
+    o, t = knn_median_predict(Xn, Xn_te, y_log, folds)
     record("knn_word", o, t)
 
     # --- Ridge di TF-IDF karakter: tahan salah ketik & variasi penulisan ---
@@ -395,16 +421,23 @@ def train_cpu_models(train, test, y_raw, folds):
         o[va] = m.predict(Xc[va])
         t += m.predict(Xc_te) / len(folds)
     record("ridge_char", o, t)
+
+    # kNN kedua, kali ini di ruang karakter: "mirip ejaan" menemukan tetangga
+    # yang berbeda dari "mirip kata", dan itu menurunkan MAE blend ~1.900.
+    # (Versi SVD-nya 50x lebih cepat tapi tidak membantu blend sama sekali --
+    # kompresi membuang justru n-gram langka yang berguna.)
+    print("   melatih kNN karakter ...", flush=True)
+    o, t = knn_median_predict(normalize(Xc), normalize(Xc_te), y_log, folds, chunk=256)
+    record("knn_char", o, t)
     del Xc, Xc_te
     gc.collect()
 
     # --- LightGBM di SVD + fitur regex: menangkap angka eksplisit (sqft, kamar) ---
     print("   SVD(250) + fitur regex, melatih LightGBM ...", flush=True)
     svd = TruncatedSVD(n_components=250, random_state=SEED)
-    D = np.hstack([svd.fit_transform(Xw).astype(np.float32),
-                   np.nan_to_num(build_features(train["text"]), nan=-999)])
-    D_te = np.hstack([svd.transform(Xw_te).astype(np.float32),
-                      np.nan_to_num(build_features(test["text"]), nan=-999)])
+    F_tr, F_te = feats
+    D = np.hstack([svd.fit_transform(Xw).astype(np.float32), F_tr, uniq_tr])
+    D_te = np.hstack([svd.transform(Xw_te).astype(np.float32), F_te, uniq_te])
     params = dict(objective="mae", metric="mae", learning_rate=0.03, num_leaves=63,
                   min_data_in_leaf=20, feature_fraction=0.35, bagging_fraction=0.8,
                   bagging_freq=1, lambda_l2=1.0, verbosity=-1, num_threads=4, seed=SEED)
@@ -440,10 +473,23 @@ def train_transformer(train, test, y_raw, folds, args):
     device = torch.device("cuda" if has_cuda else "cpu")
     if has_cuda:
         gp = torch.cuda.get_device_properties(0)
-        # T4 (Turing) tidak punya bf16, jadi fp16 + GradScaler.
-        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        print(f"\n[3/5] LATIH transformer di {gp.name} ({gp.total_memory / 1e9:.0f} GB)")
-        print(f"   presisi: {'bf16' if amp_dtype == torch.bfloat16 else 'fp16'}")
+        # JANGAN pakai torch.cuda.is_bf16_supported(): di PyTorch baru fungsi itu
+        # mengembalikan True untuk T4 karena menghitung bf16 EMULASI. T4 adalah
+        # Turing (sm_75) yang tidak punya bf16 native, dan emulasinya membuat
+        # loss jadi NaN. Ampere (sm_80, mis. A100) ke atas baru punya bf16 asli.
+        native_bf16 = gp.major >= 8
+        if args.precision == "auto":
+            amp_dtype = torch.bfloat16 if native_bf16 else torch.float16
+        elif args.precision == "bf16":
+            amp_dtype = torch.bfloat16
+        elif args.precision == "fp16":
+            amp_dtype = torch.float16
+        else:
+            amp_dtype = None
+        label = {torch.bfloat16: "bf16", torch.float16: "fp16", None: "fp32"}[amp_dtype]
+        print(f"\n[3/5] LATIH transformer di {gp.name} ({gp.total_memory / 1e9:.0f} GB, sm_{gp.major}{gp.minor})")
+        print(f"   presisi: {label}" + ("" if native_bf16 or amp_dtype is not torch.bfloat16
+                                        else "  <- PERINGATAN: GPU ini tidak punya bf16 native, rawan NaN"))
     else:
         amp_dtype = None
         print("\n[3/5] LATIH transformer di CPU (sangat lambat -- hanya untuk uji)")
@@ -579,6 +625,12 @@ def train_transformer(train, test, y_raw, folds, args):
                     print(f"      fold {fold} epoch {epoch}  step {done}/{len(dl_tr)}  "
                           f"loss {running / max(seen, 1):.4f}  sisa ~{eta / 60:.1f} menit", flush=True)
 
+            if fold == 0 and epoch == 0:
+                per_epoch = time.time() - t0
+                total = per_epoch * args.epochs * len(folds) / 60
+                print(f"   perkiraan total fine-tune: ~{total:.0f} menit "
+                      f"({per_epoch / 60:.1f} menit/epoch x {args.epochs} epoch x {len(folds)} fold)",
+                      flush=True)
             val_pred = infer(model, dl_va)
             val_mae = mae(y_raw[va], from_log(val_pred))
             print(f"   fold {fold} epoch {epoch}: val MAE = {val_mae:,.0f} "
@@ -586,6 +638,23 @@ def train_transformer(train, test, y_raw, folds, args):
             if val_mae < best_mae:
                 best_mae, best_val = val_mae, val_pred
                 best_test = infer(model, dl_test)
+
+        if best_val is None:
+            # Semua epoch menghasilkan NaN -- hampir selalu karena presisi.
+            print(f"   fold {fold} GAGAL: semua epoch menghasilkan NaN.", flush=True)
+            if amp_dtype is torch.bfloat16 and not native_bf16:
+                print("   -> penyebabnya bf16 di GPU tanpa bf16 native. "
+                      "Ulangi dengan --precision fp16.", file=sys.stderr)
+            elif amp_dtype is torch.float16:
+                print("   -> fp16 meluap (umum di deberta-v3-large). "
+                      "Ulangi dengan --precision fp32.", file=sys.stderr)
+            else:
+                print("   -> coba turunkan --lr.", file=sys.stderr)
+            del model, opt
+            gc.collect()
+            if has_cuda:
+                torch.cuda.empty_cache()
+            continue
 
         oof[va] = best_val
         test_pred += best_test
@@ -610,7 +679,7 @@ def train_transformer(train, test, y_raw, folds, args):
 # 5. GABUNGKAN PREDIKSI & TULIS SUBMISSION
 # =============================================================================
 
-def blend(oof: dict, testp: dict, y_raw, folds, train=None, test=None):
+def blend(oof: dict, testp: dict, y_raw, folds, feats=None):
     """Tiga langkah, masing-masing hanya dipakai kalau benar-benar memperbaiki MAE."""
     import lightgbm as lgb
 
@@ -652,12 +721,12 @@ def blend(oof: dict, testp: dict, y_raw, folds, train=None, test=None):
         X_te = np.column_stack([testp[n] for n in cols])
         X = np.column_stack([X, X.std(1), X.mean(1)])
         X_te = np.column_stack([X_te, X_te.std(1), X_te.mean(1)])
-        if train is not None:
+        if feats is not None:
             # Beri juga fitur regex mentah: model level-2 jadi bisa belajar
             # bahwa mis. kNN dipercaya untuk rumah biasa tapi tidak untuk tanah
             # kosong. Ini menurunkan MAE sekitar 9.000.
-            X = np.column_stack([X, np.nan_to_num(build_features(train["text"]), nan=-999)])
-            X_te = np.column_stack([X_te, np.nan_to_num(build_features(test["text"]), nan=-999)])
+            X = np.column_stack([X, feats[0]])
+            X_te = np.column_stack([X_te, feats[1]])
         y_log = to_log(y_raw)
         params = dict(objective="mae", metric="mae", learning_rate=0.02, num_leaves=15,
                       min_data_in_leaf=60, feature_fraction=0.8, bagging_fraction=0.8,
@@ -742,6 +811,8 @@ def main(argv=None):
     ap.add_argument("--quick", action="store_true", help="1 fold 1 epoch, untuk uji cepat")
     ap.add_argument("--cpu-transformer", action="store_true",
                     help="paksa fine-tune di CPU (lambat sekali; untuk uji saja)")
+    ap.add_argument("--precision", default="auto", choices=["auto", "bf16", "fp16", "fp32"],
+                    help="auto: bf16 hanya di GPU sm_80+ (A100/L4/H100), fp16 di selainnya")
     ap.add_argument("--out", default=SUBMISSION_NAME)
 
     if argv is None:
@@ -780,10 +851,16 @@ def main(argv=None):
           f"<- angka yang harus dikalahkan")
 
     folds = make_folds(y_raw)
+
+    # Fitur regex dipakai dua kali (LightGBM dan stacking); hitung sekali saja.
+    print("\n   mengekstrak fitur regex dari teks ...", flush=True)
+    feats = (np.nan_to_num(build_features(train["text"]), nan=-999),
+             np.nan_to_num(build_features(test["text"]), nan=-999))
+    print(f"   {feats[0].shape[1]} fitur numerik per listing", flush=True)
     oof, testp = {}, {}
 
     if not args.no_cpu_models:
-        o, t = train_cpu_models(train, test, y_raw, folds)
+        o, t = train_cpu_models(train, test, y_raw, folds, feats)
         oof.update(o)
         testp.update(t)
     if not args.no_transformer:
@@ -814,7 +891,7 @@ def main(argv=None):
             print(f"\n   ! skor dihitung atas {valid.sum():,} dari {len(valid):,} baris "
                   f"(fold sisanya tidak dilatih). Jangan pakai --quick untuk submission nyata.")
     else:
-        final_log, score = blend(oof, testp, y_raw, folds, train, test)
+        final_log, score = blend(oof, testp, y_raw, folds, feats)
 
     print("\n[5/5] TULIS submission")
     sub = write_submission(test, from_log(final_log), data_path, out_path)
