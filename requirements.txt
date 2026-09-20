@@ -1,0 +1,13 @@
+# CPU pipeline (runs anywhere, no GPU needed)
+numpy>=1.26
+pandas>=2.0
+scikit-learn>=1.4
+scipy>=1.11
+lightgbm>=4.3
+
+# Transformer pipeline (GPU strongly recommended: Kaggle T4 x2 / Colab / RunPod)
+torch>=2.4
+transformers>=4.44
+sentencepiece>=0.2.0      # needed by microsoft/deberta-v3-* tokenizers
+sentence-transformers>=3.0
+accelerate>=0.30
