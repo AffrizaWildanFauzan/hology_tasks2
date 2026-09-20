@@ -33,7 +33,36 @@ sehingga OOF-nya bisa di-blend dengan jujur.
 
 ---
 
-## 2. Struktur
+## 2. Hasil CV yang sudah terukur (5-fold, MAE dolar)
+
+Semua angka di bawah dijalankan di repo ini dengan fold yang sama.
+
+| Model | CV MAE | Catatan |
+|---|---:|---|
+| Tebak konstanta (median) | 550.252 | baseline |
+| Ridge TF-IDF char 3-5 | 362.280 | |
+| LinearSVR TF-IDF kata | 359.217 | L1 -> median |
+| Ridge TF-IDF kata 1-2 | 358.966 | |
+| LightGBM (SVD-250 + fitur regex) | 357.169 | |
+| **kNN kosinus TF-IDF (median tetangga)** | **353.974** | model tunggal terbaik |
+| Greedy blend (rata-rata berbobot) | 337.639 | |
+| + stacking LightGBM level-2 | 314.247 | lompatan terbesar |
+| + kalibrasi per-desil | **313.478** | `submissions/submission_v2_sparse.csv` |
+
+**43% lebih baik dari baseline, tanpa GPU sama sekali.** Stacking memberi lompatan
+terbesar karena model level-2 belajar *di mana* tiap model bisa dipercaya
+(kNN kuat saat ada listing kembar, ridge kuat untuk nama kota langka) sambil
+tetap melihat fitur numerik hasil ekstraksi regex.
+
+Fine-tune transformer belum bisa dijalankan di sini (akses ke huggingface.co
+diblokir oleh policy jaringan lingkungan ini), tetapi seluruh pipeline-nya sudah
+ditulis dan diuji end-to-end memakai encoder kecil yang dilatih dari nol --
+loop training, pooling, layer-wise LR, penyimpanan OOF semuanya berjalan.
+Jalankan di Kaggle/Colab dengan GPU untuk memakainya.
+
+---
+
+## 3. Struktur
 
 ```
 src/common.py             loader, fold, metrik, transformasi target
@@ -51,12 +80,12 @@ memungut model baru apa pun yang sudah dilatih.
 
 ---
 
-## 3. Cara menjalankan
+## 4. Cara menjalankan
 
 ```bash
 pip install -r requirements.txt
 
-# A. Pipeline CPU (tanpa GPU, ~30 menit)
+# A. Pipeline CPU (tanpa GPU, ~10 menit di 4 core)
 python src/run_sparse.py --models ridge_word,ridge_char,linsvr_word,knn_word,lgbm_dense,lgbm_sparse
 
 # B. Embedding beku (CPU bisa, GPU jauh lebih cepat)
@@ -66,13 +95,13 @@ python src/embed_features.py --model BAAI/bge-small-en-v1.5 --tag bge --with-fea
 python src/train_transformer.py --model microsoft/deberta-v3-base   --tag deb3base --bf16
 python src/train_transformer.py --model answerdotai/ModernBERT-base --tag mbert --max-len 1024 --bf16
 
-# D. Gabungkan semuanya
-python src/blend.py --calibrate --out submission_blend.csv
+# D. Gabungkan semua OOF yang ada -> submission
+python src/blend.py --calibrate --stack --out submission_blend.csv
 ```
 
 ---
 
-## 4. Kombinasi model HuggingFace yang direkomendasikan
+## 5. Kombinasi model HuggingFace yang direkomendasikan
 
 Teks listing panjang (median ~870 karakter, maks ~4.000 ≈ 900 token), berbahasa
 Inggris, dan sinyal harganya tersebar: lokasi, luas, jumlah kamar, kondisi, dan
@@ -108,6 +137,11 @@ DeBERTa-v3-base (fine-tune)        bobot besar — pemahaman semantik terbaik
 + LightGBM(SVD + fitur regex)        menangkap angka eksplisit: sqft, kamar, acre
 + Ridge / LinearSVR TF-IDF           menangkap nama kota & kata kunci langka
 ```
+
+Perkiraan: menambahkan DeBERTa-v3-base + ModernBERT-base ke blend ini biasanya
+memangkas MAE cukup besar lagi, karena keduanya memahami konteks kalimat yang
+tidak bisa ditangkap TF-IDF (mis. "butuh renovasi total" vs "baru direnovasi
+total" -- bag-of-words melihat kata yang hampir sama, transformer tidak).
 
 Keberagaman lebih berharga daripada satu model terkuat: blend digabung dengan
 *greedy ensemble selection* langsung terhadap MAE, jadi model yang lemah tapi

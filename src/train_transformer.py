@@ -187,6 +187,8 @@ def main():
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--bf16", action="store_true", help="use on A100/L4/H100; fp16 otherwise")
     ap.add_argument("--grad-checkpoint", action="store_true")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="subsample the training rows: for smoke-testing the pipeline")
     args = ap.parse_args()
     tag = args.tag or args.model.split("/")[-1].replace(".", "").lower()
 
@@ -197,6 +199,13 @@ def main():
     test_texts = test["text"].values
     y_raw = train["listPrice"].values.astype(float)
     y_log = to_log(y_raw)
+    if args.limit:
+        rng = np.random.default_rng(SEED)
+        keep = rng.choice(len(texts), size=min(args.limit, len(texts)), replace=False)
+        texts, y_raw = texts[keep], y_raw[keep]
+        y_log = to_log(y_raw)
+        test_texts = test_texts[:args.limit]
+        print(f"--limit: using {len(texts)} train rows / {len(test_texts)} test rows")
     splits = price_bin_folds(y_raw)
     want = range(len(splits)) if args.folds == "all" else [int(x) for x in args.folds.split(",")]
 
@@ -221,7 +230,9 @@ def main():
     test_pred /= max(used, 1)
     done = ~np.isnan(oof)
     print(f"\n[{tag}] CV MAE (on {done.sum()} rows) = {mae(y_raw[done], from_log(oof[done])):,.0f}")
-    if done.all():
+    if args.limit:
+        print("--limit was set: predictions are a smoke test, not saved for blending")
+    elif done.all():
         save_oof(tag, oof, test_pred)
         print(f"saved artifacts/oof_{tag}.npy + artifacts/test_{tag}.npy")
     else:

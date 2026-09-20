@@ -15,7 +15,6 @@ import sys
 import time
 
 import numpy as np
-import scipy.sparse as sp
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import Ridge, SGDRegressor
@@ -70,7 +69,8 @@ def ridge_fp(alpha):
 
 
 def sgd_l1_fp(alpha=1e-6, epsilon=0.05):
-    """Epsilon-insensitive loss == L1 in log space -> conditional median."""
+    """Epsilon-insensitive SGD. Kept for reference only: it needs careful LR
+    tuning and LinearSVR fits the same loss far better out of the box."""
     def fp(X, y, trn, val, Xte, k):
         m = SGDRegressor(loss="epsilon_insensitive", epsilon=epsilon, penalty="l2",
                          alpha=alpha, max_iter=60, tol=1e-4, learning_rate="invscaling",
@@ -146,7 +146,7 @@ def lgbm_fp(params=None, num_round=4000):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", default="ridge_word,ridge_char,sgd_word,lgbm_dense,lgbm_sparse")
+    ap.add_argument("--models", default="ridge_word,ridge_char,linsvr_word,knn_word,lgbm_dense")
     ap.add_argument("--svd", type=int, default=250)
     args = ap.parse_args()
     want = set(args.models.split(","))
@@ -178,7 +178,7 @@ def main():
         scores["ridge_char"] = run_cv("ridge_char", ridge_fp(1.0), Xc, Xc_te, y_log, y_raw, splits)[2]
         del Xc, Xc_te
 
-    if "lgbm_dense" in want or "lgbm_sparse" in want:
+    if "lgbm_dense" in want:
         print(f"SVD({args.svd}) on word tfidf ...", flush=True)
         svd = TruncatedSVD(n_components=args.svd, random_state=SEED)
         Z = svd.fit_transform(Xw).astype(np.float32)
@@ -188,14 +188,7 @@ def main():
         D_te = np.hstack([Z_te, np.nan_to_num(F_te, nan=-999)])
         np.save(os.path.join(ARTIFACTS, "svd_train.npy"), Z)
         np.save(os.path.join(ARTIFACTS, "svd_test.npy"), Z_te)
-        if "lgbm_dense" in want:
-            scores["lgbm_dense"] = run_cv("lgbm_dense", lgbm_fp(), D, D_te, y_log, y_raw, splits)[2]
-        if "lgbm_sparse" in want:
-            S = sp.hstack([Xw, sp.csr_matrix(np.nan_to_num(F_tr, nan=-999))]).tocsr()
-            S_te = sp.hstack([Xw_te, sp.csr_matrix(np.nan_to_num(F_te, nan=-999))]).tocsr()
-            scores["lgbm_sparse"] = run_cv(
-                "lgbm_sparse", lgbm_fp(dict(feature_fraction=0.1, num_leaves=31)), S, S_te,
-                y_log, y_raw, splits)[2]
+        scores["lgbm_dense"] = run_cv("lgbm_dense", lgbm_fp(), D, D_te, y_log, y_raw, splits)[2]
 
     print("\n== summary ==")
     for k, v in sorted(scores.items(), key=lambda kv: kv[1]):
