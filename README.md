@@ -104,8 +104,32 @@ embedding beku -> fine-tune -> blend akhir. Tahap yang artefaknya sudah ada
 gagal dicatat dan tidak menghentikan tahap lain, sehingga Anda selalu punya
 submission yang valid. Tanpa GPU, tahap fine-tune otomatis dilewati.
 
-Di Kaggle: upload `notebooks/holomine_kaggle.ipynb`, set Accelerator ke GPU dan
-Internet ON, lalu Run All. (Notebook itu hanya memanggil `holomine_solution.py`.)
+### Dari dalam notebook (Kaggle/Colab)
+
+Kalau isi file ditempel ke sel notebook, **jangan ubah `ROOT`** — skrip sudah
+menangani sendiri tidak adanya `__file__`, mencari `train.csv` otomatis (termasuk
+`/kaggle/input/<kompetisi>/` maupun `/kaggle/input/competitions/<kompetisi>/`),
+dan menulis output ke `/kaggle/working`. Panggil `run()`, bukan argumen CLI:
+
+```python
+run()                  # jalankan semua
+run(stage="cpu")       # model CPU saja
+run(tier="extra")      # + model besar
+run(folds="0,1")       # uji cepat 2 fold
+```
+
+`argparse` sengaja tidak membaca `sys.argv` di notebook, karena isinya milik
+kernel (`-f /tmp/xxx.json ...`) dan akan membuatnya mati dengan `SystemExit: 2`.
+
+Kalau data tetap tidak ketemu, paksa lokasinya:
+
+```python
+import os; os.environ["HOLOMINE_DATA"] = "/kaggle/input/nama-kompetisi"
+```
+
+Cara paling rapi tetap menjalankannya sebagai skrip:
+`!python holomine_solution.py --tier core`, atau upload
+`notebooks/holomine_kaggle.ipynb` lalu Run All (Accelerator GPU, Internet ON).
 
 ### Per tahap (kalau mau kontrol penuh)
 

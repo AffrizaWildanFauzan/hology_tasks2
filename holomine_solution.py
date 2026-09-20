@@ -49,9 +49,59 @@ import pandas as pd
 SEED = 42
 N_SPLITS = 5
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-ARTIFACTS = os.environ.get("HOLOMINE_ARTIFACTS", os.path.join(ROOT, "artifacts"))
-SUBMISSIONS = os.environ.get("HOLOMINE_SUBMISSIONS", os.path.join(ROOT, "submissions"))
+def in_notebook() -> bool:
+    """True kalau kode ini ditempel/dijalankan di dalam Jupyter, Colab, atau
+    notebook Kaggle. Dipakai untuk dua hal: jangan baca sys.argv (itu milik
+    kernel, bukan milik kita), dan jangan auto-run saat sel dieksekusi."""
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        return ip is not None and ip.__class__.__name__ != "TerminalInteractiveShell"
+    except Exception:
+        return False
+
+
+# __file__ tidak ada kalau file ini ditempel ke sel notebook -> pakai cwd.
+try:
+    ROOT = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    ROOT = os.getcwd()
+
+
+def _is_writable(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_probe")
+        with open(probe, "w"):
+            pass
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+
+def _default_out(name: str, flat_on_kaggle: bool = False) -> str:
+    """Folder output.
+
+    Di Kaggle semuanya diarahkan ke /kaggle/working: itu satu-satunya folder
+    yang bisa ditulis DAN ikut tersimpan sebagai output notebook. /kaggle/input
+    bersifat READ-ONLY, jadi mengarahkan ROOT ke sana pasti gagal saat menyimpan.
+    """
+    base = ROOT
+    on_kaggle = os.path.isdir("/kaggle/working")
+    if on_kaggle and not base.startswith("/kaggle/working"):
+        base = "/kaggle/working"
+    elif not _is_writable(base):
+        base = os.getcwd()
+    # Kaggle mengharapkan submission di /kaggle/working/submission.csv, bukan
+    # di dalam subfolder, supaya langsung terdeteksi sebagai output notebook.
+    if flat_on_kaggle and base == "/kaggle/working":
+        return base
+    return os.path.join(base, name)
+
+
+ARTIFACTS = os.environ.get("HOLOMINE_ARTIFACTS") or _default_out("artifacts")
+SUBMISSIONS = os.environ.get("HOLOMINE_SUBMISSIONS") or _default_out("submissions", flat_on_kaggle=True)
 
 # --- kombinasi model HuggingFace yang direkomendasikan ---
 # tier "core" = selalu jalan, "extra" = hanya dengan --tier extra,
@@ -108,16 +158,32 @@ SPARSE_MODELS = ["ridge_word", "ridge_char", "linsvr_word", "knn_word", "lgbm_de
 # =============================================================================
 
 def data_dir() -> str:
-    """Folder repo saat lokal; folder kompetisi saat di Kaggle."""
+    """Cari folder yang berisi train.csv.
+
+    Kaggle menaruh data di /kaggle/input/<nama-kompetisi>/, tapi lewat mount
+    Colab bisa jadi /kaggle/input/competitions/<nama>/ -- jadi dua tingkat
+    dicari, bukan satu. Anda TIDAK perlu mengubah ROOT untuk ini; kalau mau
+    memaksa, set HOLOMINE_DATA.
+    """
+    searched = []
+    cands = []
     env = os.environ.get("HOLOMINE_DATA")
-    if env and os.path.exists(os.path.join(env, "train.csv")):
-        return env
-    if os.path.exists(os.path.join(ROOT, "train.csv")):
-        return ROOT
-    for cand in sorted(glob.glob("/kaggle/input/*")):
+    if env:
+        cands.append(env)
+    cands += [ROOT, os.getcwd()]
+    for pattern in ("/kaggle/input/*", "/kaggle/input/*/*", "/content/*", "/content/*/*"):
+        cands += sorted(glob.glob(pattern))
+    for cand in cands:
+        if not cand or not os.path.isdir(cand):
+            continue
+        searched.append(cand)
         if os.path.exists(os.path.join(cand, "train.csv")):
             return cand
-    raise FileNotFoundError("train.csv tidak ketemu; set HOLOMINE_DATA ke foldernya")
+    raise FileNotFoundError(
+        "train.csv tidak ketemu. Set HOLOMINE_DATA ke folder yang berisi "
+        "train.csv/test.csv, mis.\n"
+        "  os.environ['HOLOMINE_DATA'] = '/kaggle/input/nama-kompetisi'\n"
+        "Folder yang sudah dicari: " + ", ".join(searched[:12]))
 
 
 def load_data():
@@ -1020,7 +1086,7 @@ def banner(text):
     print("\n" + "=" * 78 + f"\n {text}\n" + "=" * 78, flush=True)
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description="HoloMine Task 2 - solusi file tunggal")
     ap.add_argument("--stage", default="all", choices=["all", "cpu", "embed", "finetune", "blend"])
     ap.add_argument("--tier", default="core", choices=["core", "extra"])
@@ -1037,7 +1103,14 @@ def main():
     ap.add_argument("--huber-beta", type=float, default=0.15)
     ap.add_argument("--warmup", type=float, default=0.1)
     ap.add_argument("--weight-decay", type=float, default=0.01)
-    args = ap.parse_args()
+
+    if argv is None:
+        # Di notebook, sys.argv milik kernel ("-f /tmp/xxx.json ..."), bukan milik
+        # kita -- membacanya bikin argparse mati dengan SystemExit: 2.
+        argv = [] if in_notebook() else sys.argv[1:]
+    args, unknown = ap.parse_known_args(argv)
+    if unknown:
+        print(f"argumen diabaikan: {' '.join(unknown)}", file=sys.stderr)
 
     tiers = {"core"} if args.tier == "core" else {"core", "extra"}
     gpu = have_gpu() or (args.assume_gpu and args.dry_run)
@@ -1118,5 +1191,31 @@ def main():
     return 1 if failures else 0
 
 
-if __name__ == "__main__":
+def run(stage="all", tier="core", out="submission.csv", **kwargs):
+    """Entry point untuk notebook (Kaggle/Colab):
+
+        run()                      # jalankan semua
+        run(stage="cpu")           # model CPU saja
+        run(tier="extra")          # + model besar
+        run(folds="0,1")           # uji cepat 2 fold
+    """
+    argv = ["--stage", str(stage), "--tier", str(tier), "--out", str(out)]
+    for key, value in kwargs.items():
+        flag = "--" + key.replace("_", "-")
+        if isinstance(value, bool):
+            if value:
+                argv.append(flag)
+        else:
+            argv += [flag, str(value)]
+    return main(argv)
+
+
+if __name__ == "__main__" and not in_notebook():
     sys.exit(main())
+elif in_notebook():
+    print("Mode notebook terdeteksi. Jalankan dengan:  run()\n"
+          "  run(stage='cpu')   -> model CPU saja (tanpa GPU)\n"
+          "  run(tier='extra')  -> tambah model besar\n"
+          f"  data      : dicari otomatis (paksa lewat os.environ['HOLOMINE_DATA'])\n"
+          f"  artefak   : {ARTIFACTS}\n"
+          f"  submission: {SUBMISSIONS}")
