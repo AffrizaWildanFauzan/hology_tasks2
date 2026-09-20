@@ -86,7 +86,33 @@ memungut model baru apa pun yang sudah dilatih.
 
 ---
 
-## 4. Cara menjalankan
+## 4. Output: di mana file submission-nya
+
+Skrip menulis `submission.csv` dengan format persis `sample_submission.csv`
+(kolom `id` + `listPrice`, 3.659 baris, urutan id sama), hanya saja kolom
+`listPrice` yang tadinya `0` sudah berisi prediksi:
+
+```
+id,listPrice
+RE_015637,427069.05
+RE_005176,452326.59
+```
+
+Lokasinya:
+
+| Dijalankan di | File submission |
+|---|---|
+| lokal (skrip) | `submissions/submission.csv` |
+| Kaggle / Colab | `/kaggle/working/submission.csv` |
+
+Ubah nama file dengan `--out namaku.csv` atau `run(out="namaku.csv")`.
+Setiap tahap diakhiri blend, jadi `run(stage="cpu")` pun tetap menghasilkan
+submission -- bukan cuma artefak `.npy`. Baris terakhir di log selalu mencetak
+path lengkapnya.
+
+---
+
+## 5. Cara menjalankan
 
 ### Satu perintah (disarankan)
 
@@ -146,7 +172,7 @@ Semua hyperparameter per-model ada di dict `FINETUNE` / `EMBED` di bagian 1 file
 
 ---
 
-## 5. Kombinasi model HuggingFace yang direkomendasikan
+## 6. Kombinasi model HuggingFace yang direkomendasikan
 
 Teks listing berbahasa Inggris, median ~870 karakter (~171 token, p99 521 token),
 dan sinyal harganya tersebar: lokasi, luas, jumlah kamar, kondisi, serta kata-kata

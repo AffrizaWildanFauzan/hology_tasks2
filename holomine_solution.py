@@ -1148,6 +1148,7 @@ def main(argv=None):
     print(f"train {train.shape} | test {test.shape} | "
           f"baseline tebak-median MAE = {mae(y_raw, np.median(y_raw)):,.0f}")
     failures = []
+    final = None
 
     if args.stage in ("all", "cpu"):
         banner("TAHAP 1/5  model CPU (TF-IDF, kNN, LightGBM)")
@@ -1157,7 +1158,7 @@ def main(argv=None):
             print(f"GAGAL: {exc}", file=sys.stderr)
             failures.append("cpu")
 
-    if args.stage == "all":
+    if args.stage == "all" and (embed_picks or ft_picks):
         banner("TAHAP 2/5  submission sementara (supaya tidak pernah tangan kosong)")
         stage_blend(train, test, y_raw, splits, "submission_cpu_only.csv")
 
@@ -1179,11 +1180,18 @@ def main(argv=None):
             if res.get(tag) is None and tag in res:
                 failures.append(f"finetune:{tag}")
 
-    if args.stage in ("all", "blend"):
-        banner("TAHAP 5/5  blend akhir")
-        stage_blend(train, test, y_raw, splits, args.out)
+    # Tahap apa pun diakhiri blend, supaya menjalankan satu tahap saja pun
+    # tetap menghasilkan file submission -- bukan cuma artefak .npy.
+    banner("TAHAP 5/5  blend akhir -> submission")
+    final = stage_blend(train, test, y_raw, splits, args.out)
 
     banner("SELESAI" if not failures else "SELESAI DENGAN KEGAGALAN")
+    if final is not None:
+        path = os.path.join(SUBMISSIONS, args.out)
+        print(f"FILE SUBMISSION ANDA:\n    {path}")
+        print(f"    {len(test)} baris, kolom id + listPrice, urutan id sama dengan sample_submission.")
+        print(f"    CV MAE {final:,.0f}  (baseline tebak-median {mae(y_raw, np.median(y_raw)):,.0f})")
+        print("    -> unggah file ini ke Kaggle.")
     if failures:
         print("tahap gagal:", ", ".join(failures))
         print("Blend tetap memakai model yang berhasil. Perbaiki lalu jalankan ulang -- "
