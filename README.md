@@ -64,21 +64,24 @@ Jalankan di Kaggle/Colab dengan GPU untuk memakainya.
 
 ## 3. Struktur
 
+**Semua kode ada di satu file: `holomine_solution.py`.**
+
 ```
-src/common.py             loader, fold, metrik, transformasi target
-src/features.py           information extraction dari teks (regex) -> ~80 fitur numerik
-src/run_sparse.py         model CPU: TF-IDF ridge/SVR, kNN kosinus, LightGBM
-src/embed_features.py     embedding beku (sentence-transformers) -> Ridge/LightGBM
-src/train_transformer.py  fine-tune encoder HuggingFace (GPU)
-src/model_zoo.py          konfigurasi kombinasi model yang direkomendasikan
-src/run_all.py            runner satu perintah untuk seluruh kombinasi
-src/blend.py              greedy ensemble selection + stacking + kalibrasi
+holomine_solution.py             SELURUH pipeline, satu file tanpa dependensi internal
+  bagian 1  konfigurasi + daftar model HuggingFace yang direkomendasikan
+  bagian 2  data, fold, metrik, transformasi target
+  bagian 3  information extraction regex -> ~80 fitur numerik
+  bagian 4  model CPU: TF-IDF ridge/SVR, kNN kosinus, LightGBM
+  bagian 5  embedding beku (sentence-transformers)
+  bagian 6  fine-tune encoder HuggingFace
+  bagian 7  blend: greedy selection + stacking + kalibrasi
+  bagian 8  runner
 notebooks/holomine_kaggle.ipynb  notebook Kaggle siap Run All
-artifacts/                oof_<model>.npy & test_<model>.npy (semua di ruang log)
-submissions/              file siap unggah ke Kaggle
+artifacts/                       oof_<model>.npy & test_<model>.npy (ruang log)
+submissions/                     file siap unggah ke Kaggle
 ```
 
-Setiap model menulis OOF dengan format yang sama, jadi `blend.py` otomatis
+Setiap model menulis OOF dengan format yang sama, jadi tahap blend otomatis
 memungut model baru apa pun yang sudah dilatih.
 
 ---
@@ -90,31 +93,32 @@ memungut model baru apa pun yang sudah dilatih.
 ```bash
 pip install -r requirements.txt
 
-python src/model_zoo.py                # daftar model + hyperparameternya
-python src/run_all.py --dry-run        # lihat rencananya dulu
-python src/run_all.py                  # jalankan kombinasi inti
-python src/run_all.py --tier extra     # + model besar kalau kuota GPU masih ada
+python holomine_solution.py --dry-run     # lihat rencananya dulu
+python holomine_solution.py               # jalankan kombinasi inti
+python holomine_solution.py --tier extra  # + model besar kalau kuota GPU masih ada
 ```
 
-`run_all.py` menjalankan berurutan: model CPU -> submission sementara ->
+Skrip ini menjalankan berurutan: model CPU -> submission sementara ->
 embedding beku -> fine-tune -> blend akhir. Tahap yang artefaknya sudah ada
 **dilewati**, jadi aman dijalankan ulang setelah sesi Kaggle terputus. Tahap yang
 gagal dicatat dan tidak menghentikan tahap lain, sehingga Anda selalu punya
 submission yang valid. Tanpa GPU, tahap fine-tune otomatis dilewati.
 
 Di Kaggle: upload `notebooks/holomine_kaggle.ipynb`, set Accelerator ke GPU dan
-Internet ON, lalu Run All.
+Internet ON, lalu Run All. (Notebook itu hanya memanggil `holomine_solution.py`.)
 
 ### Per tahap (kalau mau kontrol penuh)
 
 ```bash
-python src/run_sparse.py --models ridge_word,ridge_char,linsvr_word,knn_word,lgbm_dense
-python src/embed_features.py --model Alibaba-NLP/gte-modernbert-base --tag gte --with-features
-python src/train_transformer.py --model microsoft/deberta-v3-base --tag deb3base
-python src/blend.py --calibrate --stack --out submission.csv
+python holomine_solution.py --stage cpu        # model CPU saja, tanpa GPU (~10 menit)
+python holomine_solution.py --stage embed      # embedding beku saja
+python holomine_solution.py --stage finetune   # fine-tune saja
+python holomine_solution.py --stage blend      # blend ulang dari artefak yang ada
 ```
 
-Semua hyperparameter per-model terkumpul di `src/model_zoo.py`.
+Opsi lain: `--folds 0,1` (uji cepat), `--force` (latih ulang),
+`--precision fp32` (kalau fp16 divergen di deberta-v3-large).
+Semua hyperparameter per-model ada di dict `FINETUNE` / `EMBED` di bagian 1 file.
 
 ---
 
@@ -162,7 +166,7 @@ DeBERTa-v3-base (fine-tune)         pemahaman semantik terbaik
 + Ridge / LinearSVR TF-IDF          menangkap nama kota & kata kunci langka
 ```
 
-Persis inilah yang dijalankan `python src/run_all.py` (`--tier core`).
+Persis inilah yang dijalankan `python holomine_solution.py` (`--tier core`).
 Estimasi waktu di satu T4: ~10 menit tahap CPU, ~10 menit embedding,
 ~30-45 menit per model fine-tune untuk 5 fold.
 
