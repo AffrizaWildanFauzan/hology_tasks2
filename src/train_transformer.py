@@ -32,8 +32,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (ARTIFACTS, SEED, from_log, load_data, mae, price_bin_folds,
-                    save_oof, to_log)
+from common import (ARTIFACTS, SEED, explain_hub_error, from_log, load_data, mae,
+                    price_bin_folds, save_oof, to_log)
 
 
 class ListingDataset(Dataset):
@@ -101,6 +101,22 @@ def layerwise_params(model, base_lr, head_lr, decay=0.9, weight_decay=0.01):
     return groups
 
 
+def resolve_amp_dtype(precision: str, device: torch.device):
+    """None = full fp32.
+
+    T4/V100 (Turing/Volta) have no bf16, so 'auto' falls back to fp16 there.
+    DeBERTa-v3-large is known to overflow in fp16; the NaN guard below catches
+    it and --precision fp32 is the escape hatch.
+    """
+    if device.type != "cuda" or precision == "fp32":
+        return None
+    if precision == "bf16":
+        return torch.bfloat16
+    if precision == "fp16":
+        return torch.float16
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
 @torch.no_grad()
 def predict(model, loader, device, amp_dtype):
     model.eval()
@@ -133,11 +149,12 @@ def train_fold(args, texts, y_log, y_raw, trn, val, test_texts, fold, tokenizer,
     opt = torch.optim.AdamW(layerwise_params(model, args.lr, args.head_lr, args.llrd, args.weight_decay))
     steps = max(1, len(dl_tr) // args.accum) * args.epochs
     sched = get_cosine_schedule_with_warmup(opt, int(steps * args.warmup), steps)
-    amp_dtype = (torch.bfloat16 if args.bf16 else torch.float16) if device.type == "cuda" else None
+    amp_dtype = resolve_amp_dtype(args.precision, device)
     scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
     loss_fn = nn.SmoothL1Loss(beta=args.huber_beta)
 
     best = (np.inf, None, None)
+    bad_steps = 0
     for epoch in range(args.epochs):
         model.train()
         t0 = time.time()
@@ -146,6 +163,13 @@ def train_fold(args, texts, y_log, y_raw, trn, val, test_texts, fold, tokenizer,
             labels = batch["labels"]
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
                 loss = loss_fn(model(**batch), labels) / args.accum
+            if not torch.isfinite(loss):
+                # fp16 overflow (classic on deberta-v3-large): drop the step
+                bad_steps += 1
+                opt.zero_grad(set_to_none=True)
+                if bad_steps == 50:
+                    print("  !! many non-finite losses -- rerun with --precision fp32", flush=True)
+                continue
             scaler.scale(loss).backward()
             if (step + 1) % args.accum == 0:
                 scaler.unscale_(opt)
@@ -156,6 +180,9 @@ def train_fold(args, texts, y_log, y_raw, trn, val, test_texts, fold, tokenizer,
                 sched.step()
 
         p_val = predict(model, dl_va, device, amp_dtype)
+        if not np.isfinite(p_val).all():
+            print(f"  fold {fold} epoch {epoch}: non-finite predictions, skipping epoch", flush=True)
+            continue
         score = mae(y_raw[val], from_log(p_val))
         print(f"  fold {fold} epoch {epoch}: val MAE = {score:,.0f}  ({time.time() - t0:.0f}s)", flush=True)
         if score < best[0]:
@@ -185,12 +212,16 @@ def main():
     ap.add_argument("--huber-beta", type=float, default=0.15)
     ap.add_argument("--folds", default="all", help="e.g. '0,1' to train a subset")
     ap.add_argument("--workers", type=int, default=2)
-    ap.add_argument("--bf16", action="store_true", help="use on A100/L4/H100; fp16 otherwise")
+    ap.add_argument("--precision", default="auto", choices=["auto", "bf16", "fp16", "fp32"],
+                    help="auto picks bf16 when the GPU supports it, else fp16")
+    ap.add_argument("--bf16", action="store_true", help="deprecated alias for --precision bf16")
     ap.add_argument("--grad-checkpoint", action="store_true")
     ap.add_argument("--limit", type=int, default=0,
                     help="subsample the training rows: for smoke-testing the pipeline")
     args = ap.parse_args()
     tag = args.tag or args.model.split("/")[-1].replace(".", "").lower()
+    if args.bf16:
+        args.precision = "bf16"
 
     from transformers import AutoTokenizer, DataCollatorWithPadding
 
@@ -209,7 +240,15 @@ def main():
     splits = price_bin_folds(y_raw)
     want = range(len(splits)) if args.folds == "all" else [int(x) for x in args.folds.split(",")]
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    except Exception as exc:
+        print(explain_hub_error(exc, args.model), file=sys.stderr)
+        raise SystemExit(1)
+    sample = [len(tokenizer(t, truncation=False)["input_ids"]) for t in texts[:2000]]
+    cut = float(np.mean(np.asarray(sample) > args.max_len))
+    print(f"token length: median {int(np.median(sample))}, p95 {int(np.percentile(sample, 95))}, "
+          f"max {max(sample)} -> {cut:.1%} of listings truncated at max_len={args.max_len}", flush=True)
     collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"{args.model} -> tag '{tag}' on {device}", flush=True)

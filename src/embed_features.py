@@ -19,14 +19,18 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (ARTIFACTS, SEED, from_log, load_data, mae, price_bin_folds,
-                    save_oof, to_log)
+from common import (ARTIFACTS, SEED, explain_hub_error, from_log, load_data, mae,
+                    price_bin_folds, save_oof, to_log)
 
 
 def encode(model_name, texts, max_len, batch_size, prefix=""):
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(model_name, trust_remote_code=True)
+    try:
+        model = SentenceTransformer(model_name, trust_remote_code=True)
+    except Exception as exc:
+        print(explain_hub_error(exc, model_name), file=sys.stderr)
+        raise SystemExit(1)
     model.max_seq_length = max_len
     payload = [prefix + t for t in texts] if prefix else list(texts)
     return model.encode(payload, batch_size=batch_size, show_progress_bar=True,

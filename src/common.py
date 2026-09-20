@@ -84,3 +84,26 @@ def make_submission(test_ids, prices, filename: str) -> str:
         path, index=False
     )
     return path
+
+
+def explain_hub_error(exc: Exception, model_name: str) -> str:
+    """Terjemahkan kegagalan unduh HuggingFace jadi langkah yang bisa dikerjakan."""
+    text = f"{type(exc).__name__}: {exc}"
+    hints = [f"Gagal memuat '{model_name}'.", f"  penyebab: {text.splitlines()[0][:200]}"]
+    low = text.lower()
+    if "403" in low or "proxy" in low or "connect" in low or "resolve" in low or "timed out" in low:
+        hints += [
+            "  -> Sepertinya jaringan memblokir huggingface.co.",
+            "     Kaggle: Notebook Settings -> Internet: ON.",
+            "     Offline: unggah bobot sebagai Kaggle Dataset, ganti 'model' di",
+            "     src/model_zoo.py ke path lokalnya, lalu set HF_HUB_OFFLINE=1.",
+        ]
+    elif "401" in low or "gated" in low or "authoriz" in low:
+        hints += ["  -> Model gated: terima lisensinya di halaman model lalu login `huggingface-cli login`."]
+    elif "not a local folder" in low or "404" in low or "repositorynotfound" in low:
+        hints += ["  -> Nama model salah ketik, atau repo privat."]
+    elif "sentencepiece" in low or "protobuf" in low:
+        hints += ["  -> Tokenizer deberta-v3 butuh: pip install sentencepiece protobuf"]
+    elif "modernbert" in low or "unrecognized" in low or "trust_remote_code" in low:
+        hints += ["  -> ModernBERT butuh transformers>=4.48: pip install -U 'transformers>=4.48'"]
+    return "\n".join(hints)

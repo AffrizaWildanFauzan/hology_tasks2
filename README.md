@@ -70,7 +70,10 @@ src/features.py           information extraction dari teks (regex) -> ~80 fitur 
 src/run_sparse.py         model CPU: TF-IDF ridge/SVR, kNN kosinus, LightGBM
 src/embed_features.py     embedding beku (sentence-transformers) -> Ridge/LightGBM
 src/train_transformer.py  fine-tune encoder HuggingFace (GPU)
-src/blend.py              greedy ensemble selection + kalibrasi -> submission
+src/model_zoo.py          konfigurasi kombinasi model yang direkomendasikan
+src/run_all.py            runner satu perintah untuk seluruh kombinasi
+src/blend.py              greedy ensemble selection + stacking + kalibrasi
+notebooks/holomine_kaggle.ipynb  notebook Kaggle siap Run All
 artifacts/                oof_<model>.npy & test_<model>.npy (semua di ruang log)
 submissions/              file siap unggah ke Kaggle
 ```
@@ -82,39 +85,60 @@ memungut model baru apa pun yang sudah dilatih.
 
 ## 4. Cara menjalankan
 
+### Satu perintah (disarankan)
+
 ```bash
 pip install -r requirements.txt
 
-# A. Pipeline CPU (tanpa GPU, ~10 menit di 4 core)
-python src/run_sparse.py --models ridge_word,ridge_char,linsvr_word,knn_word,lgbm_dense,lgbm_sparse
-
-# B. Embedding beku (CPU bisa, GPU jauh lebih cepat)
-python src/embed_features.py --model BAAI/bge-small-en-v1.5 --tag bge --with-features
-
-# C. Fine-tune transformer (GPU)
-python src/train_transformer.py --model microsoft/deberta-v3-base   --tag deb3base --bf16
-python src/train_transformer.py --model answerdotai/ModernBERT-base --tag mbert --max-len 1024 --bf16
-
-# D. Gabungkan semua OOF yang ada -> submission
-python src/blend.py --calibrate --stack --out submission_blend.csv
+python src/model_zoo.py                # daftar model + hyperparameternya
+python src/run_all.py --dry-run        # lihat rencananya dulu
+python src/run_all.py                  # jalankan kombinasi inti
+python src/run_all.py --tier extra     # + model besar kalau kuota GPU masih ada
 ```
+
+`run_all.py` menjalankan berurutan: model CPU -> submission sementara ->
+embedding beku -> fine-tune -> blend akhir. Tahap yang artefaknya sudah ada
+**dilewati**, jadi aman dijalankan ulang setelah sesi Kaggle terputus. Tahap yang
+gagal dicatat dan tidak menghentikan tahap lain, sehingga Anda selalu punya
+submission yang valid. Tanpa GPU, tahap fine-tune otomatis dilewati.
+
+Di Kaggle: upload `notebooks/holomine_kaggle.ipynb`, set Accelerator ke GPU dan
+Internet ON, lalu Run All.
+
+### Per tahap (kalau mau kontrol penuh)
+
+```bash
+python src/run_sparse.py --models ridge_word,ridge_char,linsvr_word,knn_word,lgbm_dense
+python src/embed_features.py --model Alibaba-NLP/gte-modernbert-base --tag gte --with-features
+python src/train_transformer.py --model microsoft/deberta-v3-base --tag deb3base
+python src/blend.py --calibrate --stack --out submission.csv
+```
+
+Semua hyperparameter per-model terkumpul di `src/model_zoo.py`.
 
 ---
 
 ## 5. Kombinasi model HuggingFace yang direkomendasikan
 
-Teks listing panjang (median ~870 karakter, maks ~4.000 ≈ 900 token), berbahasa
-Inggris, dan sinyal harganya tersebar: lokasi, luas, jumlah kamar, kondisi, dan
-kata-kata mewah. Yang dibutuhkan encoder yang kuat di teks panjang — bukan LLM generatif.
+Teks listing berbahasa Inggris, median ~870 karakter (~171 token, p99 521 token),
+dan sinyal harganya tersebar: lokasi, luas, jumlah kamar, kondisi, serta kata-kata
+mewah. Yang dibutuhkan encoder pemahaman teks — bukan LLM generatif.
 
 ### Prioritas 1 — fine-tune (kontribusi terbesar)
 
 | Model | Kenapa cocok | Catatan |
 |---|---|---|
 | [`microsoft/deberta-v3-base`](https://huggingface.co/microsoft/deberta-v3-base) | Juara de-facto regresi teks di Kaggle (disentangled attention). Titik awal terbaik. | `max_len 512`, lr 2e-5, 3 epoch |
-| [`answerdotai/ModernBERT-base`](https://huggingface.co/answerdotai/ModernBERT-base) | Konteks 8k, arsitektur 2024, cepat. Bisa membaca listing terpanjang **utuh**. | `--max-len 1024`, butuh `transformers>=4.48` |
+| [`answerdotai/ModernBERT-base`](https://huggingface.co/answerdotai/ModernBERT-base) | Arsitektur & tokenizer 2024 yang berbeda dari DeBERTa, dan lebih cepat. | `max_len 512`, butuh `transformers>=4.48` |
 | [`microsoft/deberta-v3-large`](https://huggingface.co/microsoft/deberta-v3-large) | Biasanya 2–4% lebih baik dari base bila tuning stabil. | lr 8e-6, `--grad-checkpoint`, batch kecil |
 | [`answerdotai/ModernBERT-large`](https://huggingface.co/answerdotai/ModernBERT-large) | Pasangan besar yang beragam dari DeBERTa. | perlu ≥16 GB VRAM |
+
+**Soal panjang teks:** diukur langsung di `train.csv`, p99 = 521 token dan pada
+`max_len=512` hanya **1,1%** listing yang terpotong (itu pun dengan tokenizer
+bervocab kecil yang memecah kata lebih banyak daripada tokenizer asli kedua model
+ini). Jadi konteks panjang ModernBERT **bukan** keunggulan nyata di sini — semua
+model dijalankan di 512, dan nilai ModernBERT murni dari keberagaman arsitektur.
+Ini menghemat separuh waktu latihnya.
 
 ### Prioritas 2 — embedding beku (murah, menambah keberagaman)
 
@@ -130,13 +154,17 @@ kata-kata mewah. Yang dibutuhkan encoder yang kuat di teks panjang — bukan LLM
 ### Kombinasi final yang disarankan
 
 ```
-DeBERTa-v3-base (fine-tune)        bobot besar — pemahaman semantik terbaik
-+ ModernBERT-base (fine-tune)      arsitektur/tokenizer berbeda -> error tidak berkorelasi
-+ gte-modernbert-base (beku + LGBM) tangkapan sinyal berbeda, biaya rendah
+DeBERTa-v3-base (fine-tune)         pemahaman semantik terbaik
++ ModernBERT-base (fine-tune)       arsitektur/tokenizer berbeda -> error tidak berkorelasi
++ gte-modernbert-base (beku + LGBM) sudut pandang berbeda, biaya rendah
 + kNN kosinus TF-IDF                menangkap listing "kembar" di pasar yang sama
-+ LightGBM(SVD + fitur regex)        menangkap angka eksplisit: sqft, kamar, acre
-+ Ridge / LinearSVR TF-IDF           menangkap nama kota & kata kunci langka
++ LightGBM(SVD + fitur regex)       menangkap angka eksplisit: sqft, kamar, acre
++ Ridge / LinearSVR TF-IDF          menangkap nama kota & kata kunci langka
 ```
+
+Persis inilah yang dijalankan `python src/run_all.py` (`--tier core`).
+Estimasi waktu di satu T4: ~10 menit tahap CPU, ~10 menit embedding,
+~30-45 menit per model fine-tune untuk 5 fold.
 
 Perkiraan: menambahkan DeBERTa-v3-base + ModernBERT-base ke blend ini biasanya
 memangkas MAE cukup besar lagi, karena keduanya memahami konteks kalimat yang
